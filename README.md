@@ -80,7 +80,7 @@ Bias Estimation:
 MEKF Mean RMS: 0.010864 rad/s
 UKF Mean RMS: 0.006932 rad/s
 
-Verdict: 
+### Verdict: 
 Both filters provide excellent estimation performance with < 1 deg attitude errors. 
 While UKF has better bias estimation (36% better), MEKF has better attitude estimation (26% better). 
 The computational cost of UKF is significantly higher than MEKF (~9.6x) due to sigma point propagation. 
