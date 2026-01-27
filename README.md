@@ -96,8 +96,12 @@ The **MEKF** is the clear winner for real-time applications on constrained hardw
 - **NEES/NIS**: Multi-run Monte Carlo trials (N=50) confirm both filters are well-tuned. NEES remains within the 95% confidence intervals for the 6-DOF state.
 - **Computational Cost**: UKF provides a safety margin for non-linear convergence at a high CPU cost (9x). MEKF is recommended for nominal operations.
 
-## 8. References
+## 7. References
 - **For UKF (USQUE) implementation**: Crassidis, J. L., & Markley, F. L. (2003). Unscented Filtering for Spacecraft Attitude Estimation. Journal of Guidance, Control, and Dynamics, 26(4).
 - **For MEKF implementation**: Lefferts, E. J., Markley, F. L., & Shuster, M. D. (1982). Kalman Filtering for Spacecraft Attitude Estimation. Journal of Guidance, Control, and Dynamics, 5(5).
 - **For disturbance modelling and frame conversion**: Vallado, D. A. (2013). Fundamentals of Astrodynamics and Applications (4th ed.).
 - **For sensor models**: Markley, F. L., & Crassidis, J. L. (2014). Fundamentals of Spacecraft Attitude Determination and Control. & Wertz, J. R. (Ed.). (1978). Spacecraft Attitude Determination and Control.
+
+## Author:
+**Batuhan Akkova**
+[Email](mailto:batuhanakkova1@gmail.com)
