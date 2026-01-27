@@ -8,8 +8,8 @@ import time as pytime
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.utils import q_norm, q_mult, q_inv, q_to_dgm, quat_to_mrp 
-from src.dynamics import rk4_step
-from src.orbit import rk4_orbit_step
+from src.dynamics import rk4_step, rk4_dynamics_step
+from src.orbit import rk4_orbit_step, gravity_gradient_torque, drag_accel, srp_accel, aerodynamic_torque, srp_torque
 from src.measurements import get_true_mag_field, get_true_sun_vector
 from src.sensors.gyro import Gyroscope
 from src.sensors.magnetometer import Magnetometer
@@ -24,6 +24,15 @@ def run_simulation():
     t_end = 500.0
     steps = int(t_end / dt)
     time = np.linspace(0, t_end, steps)
+    
+    # Spacecraft Properties
+    mass = 10.0 # kg
+    area = 0.1 # m^2
+    Cd = 2.2
+    Cr = 1.8
+    I = np.diag([0.08, 0.08, 0.02]) # kg m^2
+    com_body = np.zeros(3)
+    cp_body = np.array([0.05, 0.05, 0.0]) # Offset CoP to induce torque
     
     # Initial Orbit (LEO, 500km altitude, 45 deg inclination)
     RE = 6378.137
@@ -41,6 +50,11 @@ def run_simulation():
     
     # Initial Attitude State
     true_q = np.array([0., 0., 0., 1.])
+    true_omega = np.array([0.06, 0.02, -0.01]) # Initial tumbling
+    
+    # Combined Dynamics State: [q(4), omega(3)]
+    true_dyn_state = np.concatenate([true_q, true_omega])
+    
     # True Bias initialized but will walk
     init_true_bias = np.array([0.01, -0.02, 0.005]) 
     
@@ -62,11 +76,6 @@ def run_simulation():
     R_mag = np.eye(3) * (mag_sensor.noise_std**2)
     R_sun = np.eye(3) * (sun_sensor.noise_std**2)
     
-    # or better, Update MEKF/UKF to accept R in update() (Future Task).
-    
-    # CRITICAL: We should normalize magnetometer readings for the filter or adjust R dynamically.
-    # Let's normalize Mag measurements to unit vectors for consistency with Sun sensor.
-    
     R = np.eye(3) * (0.01**2) # Generic R for unit vectors
     mekf = MEKF(init_state_est.copy(), P0.copy(), Q.copy(), R.copy())
     ukf = UKF(init_state_est.copy(), P0.copy(), Q.copy(), R.copy())
@@ -74,35 +83,53 @@ def run_simulation():
     # Storage
     history = {
         'time': [],
-        'true_q': [], 'true_bias': [],
+        'true_q': [], 'true_bias': [], 'true_omega': [],
+        'dist_torque': [], 'dist_force': [],
         'mekf_q': [], 'mekf_bias': [], 'mekf_err': [],
         'ukf_q': [], 'ukf_bias': [], 'ukf_err': []
     }
     
     print(f"Starting simulation for {steps} steps ({t_end} s)...")
     
-    # True Angular Velocity Function (Tumbling)
-    def get_true_omega(t):
-        return np.array([0.06 * np.sin(0.1*t), 0.02 * np.cos(0.05*t), -0.01])
-
     for k in range(steps):
         t = time[k]
         
-        # Dynamics Propagation
-        # Orbit
-        true_orbit_state = rk4_orbit_step(true_orbit_state, dt)
+        # Current States
         r_eci = true_orbit_state[:3]
+        v_eci = true_orbit_state[3:]
         
-        # Attitude (Kinematics with synthetic omega)
-        true_omega_val = get_true_omega(t)
-        # Propagate q
-        temp_att_state = np.concatenate([true_q, np.zeros(3)]) # Bias handled by sensor
-        temp_att_next = rk4_step(temp_att_state, true_omega_val, dt)
-        true_q = temp_att_next[:4]
+        curr_q = true_dyn_state[:4]
+        curr_omega = true_dyn_state[4:]
         
+        # Calculate Disturbances (Forces & Torques)
         # Environment
         B_eci = get_true_mag_field(r_eci)
-        S_eci = get_true_sun_vector(t)
+        S_eci = get_true_sun_vector(t) # Sun Vector from Earth to Sun.
+        
+        # Forces (ECI)
+        a_drag = drag_accel(r_eci, v_eci, mass, area, Cd)
+        # srp_accel needs vector TO sun. S_eci points TO sun.
+        a_srp = srp_accel(r_eci, S_eci, mass, area, Cr)
+        
+        total_dist_accel = a_drag + a_srp
+        
+        # Torques (Body)
+        tau_gg = gravity_gradient_torque(r_eci, I, curr_q)
+        tau_aero = aerodynamic_torque(r_eci, v_eci, curr_q, area, Cd, cp_body, com_body)
+        tau_srp = srp_torque(r_eci, S_eci, curr_q, area, Cr, cp_body, com_body)
+        
+        total_torque = tau_gg + tau_aero + tau_srp
+        
+        # Dynamics Propagation
+        
+        # Orbit
+        true_orbit_state = rk4_orbit_step(true_orbit_state, dt, disturbance_accel=total_dist_accel)
+        r_eci = true_orbit_state[:3] # Update
+        
+        # Attitude Dynamics
+        true_dyn_state = rk4_dynamics_step(true_dyn_state, dt, total_torque, I)
+        true_q = true_dyn_state[:4]
+        true_omega_val = true_dyn_state[4:]
         
         # Measurements
         # Transform to Body
@@ -145,6 +172,9 @@ def run_simulation():
         history['time'].append(t)
         history['true_q'].append(true_q.copy())
         history['true_bias'].append(gyro.get_bias()) # Current bias
+        history['true_omega'].append(true_omega_val.copy())
+        history['dist_torque'].append(total_torque.copy())
+        history['dist_force'].append(total_dist_accel.copy())
         
         history['mekf_q'].append(mekf.state[:4].copy())
         history['mekf_bias'].append(mekf.state[4:].copy())
@@ -165,6 +195,9 @@ def run_simulation():
         
     print("Optimization Complete. Saving Plots...")
     
+    if not os.path.exists('figures'):
+        os.makedirs('figures')
+
     # Plotting
     plt.figure(figsize=(10, 6))
     plt.plot(history['time'], history['mekf_err'], label='MEKF Error (rad)', alpha=0.7)
@@ -188,7 +221,18 @@ def run_simulation():
     plt.grid(True)
     plt.savefig('figures/bias_estimation.png')
     
-    print("Plots saved to figures/attitude_error.png and figures/bias_estimation.png")
+    plt.figure(figsize=(10, 6))
+    plt.plot(history['time'], history['dist_torque'][:, 0], label='Tx')
+    plt.plot(history['time'], history['dist_torque'][:, 1], label='Ty')
+    plt.plot(history['time'], history['dist_torque'][:, 2], label='Tz')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Torque (Nm)')
+    plt.title('Environmental Torques')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('figures/torques.png')
+    
+    print("Plots saved to figures/")
 
 if __name__ == '__main__':
     run_simulation()

@@ -3,14 +3,15 @@ import matplotlib.pyplot as plt
 import sys
 import os
 import multiprocessing
+import time
 from tqdm import tqdm
 
 # Add root to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.utils import q_norm, q_mult, q_inv, q_to_dgm, quat_to_mrp 
-from src.dynamics import rk4_step
-from src.orbit import rk4_orbit_step
+from src.dynamics import rk4_step, rk4_dynamics_step
+from src.orbit import rk4_orbit_step, gravity_gradient_torque, drag_accel, srp_accel, aerodynamic_torque, srp_torque
 from src.measurements import get_true_mag_field, get_true_sun_vector
 from src.sensors.gyro import Gyroscope
 from src.sensors.magnetometer import Magnetometer
@@ -31,6 +32,15 @@ def run_worker(args):
     bias_scale = config.get('bias_scale', 1.0)
     eclipse_sim = config.get('eclipse_sim', False)
     
+    # Spacecraft Properties
+    mass = 10.0 # kg
+    area = 0.1 # m^2
+    Cd = 2.2
+    Cr = 1.8
+    I = np.diag([0.08, 0.08, 0.02]) # kg m^2
+    com_body = np.zeros(3)
+    cp_body = np.array([0.05, 0.05, 0.0])
+    
     # Initialize Storage for single run
     nees_mekf = np.zeros(steps)
     nees_ukf = np.zeros(steps)
@@ -40,6 +50,9 @@ def run_worker(args):
     err_mekf = np.zeros((steps, 6))
     err_ukf = np.zeros((steps, 6))
     cov_mekf = np.zeros((steps, 6))
+
+    mekf_total_time = 0.0
+    ukf_total_time = 0.0
     
     # Random Initial Conditions
     RE = 6378.137
@@ -56,6 +69,11 @@ def run_worker(args):
     axis /= np.linalg.norm(axis)
     angle = np.random.uniform(0, 2*np.pi)
     true_q = np.array([axis[0]*np.sin(angle/2), axis[1]*np.sin(angle/2), axis[2]*np.sin(angle/2), np.cos(angle/2)])
+    true_q = q_norm(true_q)
+    
+    # Random Initial Omega
+    true_omega = np.array([0.06, 0.02, -0.01]) + np.random.randn(3)*0.001
+    true_dyn_state = np.concatenate([true_q, true_omega])
     
     # Random Initial Bias
     init_true_bias = np.random.normal(0, 0.01 * bias_scale, 3) 
@@ -83,9 +101,6 @@ def run_worker(args):
     mekf = MEKF(init_state_est.copy(), P0.copy(), Q.copy(), R_generic.copy())
     ukf = UKF(init_state_est.copy(), P0.copy(), Q.copy(), R_generic.copy())
     
-    def get_true_omega(t):
-       return np.array([0.06 * np.sin(0.1*t + run_idx), 0.02 * np.cos(0.05*t), -0.01])
-
     for k in range(steps):
         t = time_arr[k]
         
@@ -94,20 +109,38 @@ def run_worker(args):
             if 50.0 <= t <= 150.0:
                 in_eclipse = True
         
-        # Dynamics
-        true_orbit_state = rk4_orbit_step(true_orbit_state, dt)
+        # Current States
         r_eci = true_orbit_state[:3]
+        v_eci = true_orbit_state[3:]
         
-        true_omega_val = get_true_omega(t)
-        temp_state = np.concatenate([true_q, np.zeros(3)])
-        temp_next = rk4_step(temp_state, true_omega_val, dt)
-        true_q = temp_next[:4]
-        current_bias = gyro.get_bias()
+        curr_q = true_dyn_state[:4]
         
-        # Env
+        # Calculate Disturbances
         B_eci = get_true_mag_field(r_eci)
         S_eci = get_true_sun_vector(t)
         
+        # Forces
+        a_drag = drag_accel(r_eci, v_eci, mass, area, Cd)
+        a_srp = srp_accel(r_eci, S_eci, mass, area, Cr)
+        total_dist_accel = a_drag + a_srp
+        
+        # Torques
+        tau_gg = gravity_gradient_torque(r_eci, I, curr_q)
+        tau_aero = aerodynamic_torque(r_eci, v_eci, curr_q, area, Cd, cp_body, com_body)
+        tau_srp = srp_torque(r_eci, S_eci, curr_q, area, Cr, cp_body, com_body)
+        total_torque = tau_gg + tau_aero + tau_srp
+        
+        # Dynamics
+        true_orbit_state = rk4_orbit_step(true_orbit_state, dt, disturbance_accel=total_dist_accel)
+        r_eci = true_orbit_state[:3]
+        
+        true_dyn_state = rk4_dynamics_step(true_dyn_state, dt, total_torque, I)
+        true_q = true_dyn_state[:4]
+        true_omega_val = true_dyn_state[4:]
+        
+        current_bias = gyro.get_bias()
+        
+        # Transform for Sensors
         dgm_true = q_to_dgm(true_q)
         B_body = dgm_true.T @ B_eci
         S_body = dgm_true.T @ S_eci
@@ -123,6 +156,7 @@ def run_worker(args):
         S_meas = sun_sensor.measure(S_body, in_eclipse=in_eclipse)
         
         # MEKF
+        t_start_m = time.perf_counter()
         mekf.predict(omega_meas, dt)
         
         nis_m = 0.0
@@ -138,10 +172,13 @@ def run_worker(args):
             nis_val = mekf.update(S_meas, S_eci)
             nis_m += nis_val
             count_m += 1
+        t_end_m = time.perf_counter()
+        mekf_total_time += (t_end_m - t_start_m)
         
         nis_mekf[k] = nis_m / max(1, count_m)
         
         # UKF
+        t_start_u = time.perf_counter()
         ukf.predict(omega_meas, dt)
         
         nis_u = 0.0
@@ -157,6 +194,8 @@ def run_worker(args):
             nis_val = ukf.update(S_meas, S_eci)
             nis_u += nis_val
             count_u += 1
+        t_end_u = time.perf_counter()
+        ukf_total_time += (t_end_u - t_start_u)
             
         nis_ukf[k] = nis_u / max(1, count_u)
 
@@ -186,7 +225,9 @@ def run_worker(args):
         'nis_ukf': nis_ukf,
         'err_mekf': err_mekf,
         'err_ukf': err_ukf,
-        'cov_mekf': cov_mekf
+        'cov_mekf': cov_mekf,
+        'time_mekf': mekf_total_time,
+        'time_ukf': ukf_total_time
     }
 
 def run_monte_carlo(config=None, show_plots=False, save_prefix="nominal"):
@@ -224,6 +265,13 @@ def run_monte_carlo(config=None, show_plots=False, save_prefix="nominal"):
     err_mekf = np.array([r['err_mekf'] for r in results])
     err_ukf = np.array([r['err_ukf'] for r in results])
     cov_mekf = np.array([r['cov_mekf'] for r in results])
+    
+    time_mekf = np.array([r['time_mekf'] for r in results])
+    time_ukf = np.array([r['time_ukf'] for r in results])
+    
+    avg_time_mekf = np.mean(time_mekf)
+    avg_time_ukf = np.mean(time_ukf)
+    print(f"Avg Computation Time per Run: MEKF={avg_time_mekf:.4f}s | UKF={avg_time_ukf:.4f}s")
 
     # Post Processing
     avg_nees_mekf = np.mean(nees_mekf, axis=0)
@@ -235,6 +283,8 @@ def run_monte_carlo(config=None, show_plots=False, save_prefix="nominal"):
     avg_sigma_mekf = np.mean(cov_mekf, axis=0)
     
     # Create Output Directory
+    if not os.path.exists('figures'):
+        os.makedirs('figures')
     output_dir = os.path.join('figures', save_prefix)
     os.makedirs(output_dir, exist_ok=True)
     
@@ -288,6 +338,13 @@ def run_monte_carlo(config=None, show_plots=False, save_prefix="nominal"):
     plt.legend()
     plt.savefig(os.path.join(output_dir, 'hist.png'))
     plt.close()
+
+    # 5. Save Stats
+    with open(os.path.join(output_dir, 'stats.txt'), 'w') as f:
+        f.write(f"MEKF Avg Time: {avg_time_mekf:.6f} s\n")
+        f.write(f"UKF Avg Time: {avg_time_ukf:.6f} s\n")
+        f.write(f"MEKF Avg NEES: {np.mean(avg_nees_mekf):.4f}\n")
+        f.write(f"UKF Avg NEES: {np.mean(avg_nees_ukf):.4f}\n")
 
     print(f"Finished {save_prefix}.")
 
